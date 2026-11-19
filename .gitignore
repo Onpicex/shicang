@@ -1,0 +1,19 @@
+# 构建产物
+build/
+App/Shicang.xcodeproj/
+App/Generated/
+Core/.build/
+.swiftpm/
+*.xcuserstate
+xcuserdata/
+.DS_Store
+
+# 早期原型（已被正式版取代）
+prototype/
+
+# 开发过程记录（含本机环境细节，不公开）
+docs/方案-v*.md
+docs/P*-结果.md
+
+# 快捷指令由 scripts/make_shortcut.py 生成；签过名的文件带签名者的 Apple ID 信息
+shortcuts/*.shortcut

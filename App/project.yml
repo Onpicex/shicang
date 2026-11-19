@@ -1,0 +1,54 @@
+name: Shicang
+options:
+  bundleIdPrefix: com.shicang
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+packages:
+  ShicangCore:
+    path: ../Core
+  KeyboardShortcuts:
+    url: https://github.com/sindresorhus/KeyboardShortcuts
+    exactVersion: 1.10.0
+targets:
+  Shicang:
+    type: application
+    platform: macOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: Sources
+      - path: Resources
+        buildPhase: resources
+    dependencies:
+      - package: ShicangCore
+        product: ShicangCore
+      - package: KeyboardShortcuts
+        product: KeyboardShortcuts
+    info:
+      path: Generated/Info.plist
+      properties:
+        CFBundleName: 拾藏
+        CFBundleDisplayName: 拾藏
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        CFBundleIconFile: AppIcon
+        LSApplicationCategoryType: public.app-category.productivity
+        LSMinimumSystemVersion: "26.0"
+        NSHighResolutionCapable: true
+        CFBundleURLTypes:
+          - CFBundleURLName: com.shicang.app
+            CFBundleURLSchemes: [shicang]
+        # 不允许 http 连接，没有例外：ATS 保持系统默认、不开任何例外——非本机的 http 系统直接拦（-1022）。
+        # ATS 默认还放行本机回环 http，所以代码里统一改走 https 并拦掉其余（Core/.../HTTP.swift 的 NetPolicy），localhost 也不放行
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.shicang.app
+        PRODUCT_NAME: Shicang
+        SWIFT_VERSION: "6.0"
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
+        GENERATE_INFOPLIST_FILE: NO
+        ENABLE_HARDENED_RUNTIME: NO
+        ENABLE_APP_SANDBOX: NO
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGN_IDENTITY: ""
+        DEAD_CODE_STRIPPING: YES
