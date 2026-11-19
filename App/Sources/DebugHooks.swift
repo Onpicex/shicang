@@ -6,6 +6,10 @@ import ShicangCore
 /// 只在测试模式（SHICANG_TEST_ROOT）下生效的调试入口，用来在没有屏幕录制/辅助功能权限时做窗口级验证：
 ///   shicang://debug/snapshot?name=x      把所有可见窗口画成 PNG（cacheDisplay）+ 阅读器网页快照 → <测试根>/shots/
 ///   shicang://debug/select?sidebar=all|unread|starred|review|processing|failed|uncategorized|cat:<id>|src:<x>|tag:<t>&article=<id>&index=<n>&search=<q>
+///                         &articles=<id>,<id>  /  &indexes=0,2,5  多选（直接改选中集合）  /  &all=1 全选  /  &none=1 取消选择
+///   shicang://debug/batch?op=read|unread|star|unstar|category&cat=<id>|ai|confirm|reclassify|copy|trash   对选中的多篇批量操作（trash 不弹确认）
+///   shicang://debug/key?code=51 | key?code=0&chars=a&cmd=1   列表先成为焦点，再往窗口发一次按键（51＝Delete；带 cmd 的走窗口和菜单栏的快捷键匹配）
+///   shicang://debug/press?label=<按钮文字>&index=<n>   在主窗口的无障碍树里找第 n 个文字相符的按钮，走它自己的按下动作（和真人点一样进按钮的 action）
 ///   shicang://debug/state?article=<id>&read=0|1&star=0|1&category=<id>|ai&confirm=1&tags=a,b|ai&addtag=x&reclassify=1
 ///   shicang://debug/tax?op=add|edit|delete|move|tagrename|tagdelete&id=&name=&note=&into=&by=&old=&new=&tag=
 ///   shicang://debug/classify?enabled=0|1  /  shicang://debug/reclassify-all
@@ -21,6 +25,10 @@ import ShicangCore
 ///   shicang://debug/ai-draft?provider=&base=&model=&fallbacks=&key=   改设置页 AI 表单（key 只用假密钥测试）
 ///   shicang://debug/ai-draft-test | ai-draft-models | ai-draft-save | ai-draft-clearkey   点表单上的按钮
 ///   shicang://debug/list?scroll=N | list?row=N&select=1   中栏文章列表：滚到第 N 行 / 让表格选中第 N 行（快照里看换成了哪个文章 id）
+///   shicang://debug/list?row=N&menu=1   在第 N 行上模拟右键，取出列表要弹的菜单，把菜单项写进日志（不弹出来）
+///   shicang://debug/list?row=N&menu=1&pick=标题   同上，再点其中标题相同的那一项（子菜单里的也行）
+///   shicang://debug/list?rows=0,2,3&select=1   让表格一次选中多行（和 ⌘/⇧ 点按同一条路）
+///   shicang://debug/list?selectall=1&via=menu|table   ⌘A：via=menu 找菜单栏里 ⌘A 那一项，把它的动作发给列表（列表先成为焦点）；via=table 直接调表格的全选
 extension AppModel {
     func handleDebug(_ u: URL, _ q: [String: String]) {
         guard let root = testRoot else { AppLog.shared.say("忽略调试指令（非测试模式）"); return }
@@ -35,6 +43,13 @@ extension AppModel {
             if let s = q["sidebar"] { selectSidebar(Self.sidebarItem(s)) }
             if let s = q["search"] { search = s }
             if let a = q["article"] { selectedArticle = a.isEmpty ? nil : a }
+            if let a = q["articles"] { selection = Set(a.split(separator: ",").map(String.init)) }
+            if q["all"] == "1" { selectAll() }
+            if q["none"] == "1" { selection = [] }
+            if let a = q["indexes"] {
+                let list = filteredArticles
+                selection = Set(a.split(separator: ",").compactMap { Int($0) }.filter { $0 < list.count }.map { list[$0].id })
+            }
             if let a = q["index"], let i = Int(a) {
                 Task {
                     await runSearch()
@@ -82,6 +97,22 @@ extension AppModel {
         case "/pbset": debugSetPasteboard(q)
         case "/pbrestore": debugRestorePasteboard()
         case "/reader": Task { await debugReader(q) }
+        case "/batch":
+            let ids = selectedIds
+            switch q["op"] ?? "" {
+            case "read": setRead(ids: ids, true)
+            case "unread": setRead(ids: ids, false)
+            case "star": setStarred(ids: ids, true)
+            case "unstar": setStarred(ids: ids, false)
+            case "category": setCategory(ids: ids, q["cat"] == "ai" ? nil : q["cat"])
+            case "confirm": confirmCategory(ids: ids)
+            case "reclassify": reclassify(ids: ids)
+            case "copy": copyLinks(ids)
+            case "trash": trash(ids: ids)
+            default: AppLog.shared.say("调试：不认识的批量操作")
+            }
+        case "/press": debugPress(q)
+        case "/key": debugKey(q)
         case "/list": Task { await debugList(q) }
         case "/clip":
             route(PasteboardContent(text: q["text"] ?? "", html: q["html"], sourceURL: q["url"]), via: "debug")
@@ -132,7 +163,7 @@ extension AppModel {
             Self.dumpAX(w, depth: 0, into: &ax)
             try? ax.joined(separator: "\n").write(to: dir.appendingPathComponent("\(name)-w\(i)-ax.txt"), atomically: true, encoding: .utf8)
         }
-        lines.append("sidebar=\(String(describing: sidebar)) selected=\(selectedArticle ?? "-") articles=\(articles.count) queue=\(queue.count) banner=\(clipboardOffer) active=\(NSApp.isActive)")
+        lines.append("sidebar=\(String(describing: sidebar)) selected=\(selectedArticle ?? "-") 选中=\(selection.count) 篇 articles=\(articles.count) queue=\(queue.count) banner=\(clipboardOffer) active=\(NSApp.isActive)")
         // 侧栏是玻璃材质拍不到，把侧栏内容（和界面同一份数据）写成文字
         lines.append("侧栏 全部=\(articles.count) 未读=\(count(.unread)) 星标=\(count(.starred)) 待确认=\(count(.review)) 处理中=\(processing.count) 失败=\(failed.count) 未分类=\(count(.uncategorized))")
         lines.append("分类 " + taxonomy.active.map { "\($0.name)(\($0.id))=\(count(.category($0.id)))" }.joined(separator: " "))
@@ -151,11 +182,16 @@ extension AppModel {
         lines.append("AI 分类 enabled=\(classifyEnabled) platform=\(st.platform ?? "-") phase=\(st.phase) pending=\(st.pending) done=\(st.done) model=\(st.lastModel ?? "-") retry=\(st.retryAt.map { timeString($0) } ?? "-") msg=\(st.message ?? "-")")
         lines.append("搜索「\(search)」hits=\(searchHits.map { "\($0.count)" } ?? "nil") 列表=\(filteredArticles.count) 篇")
         for a in filteredArticles.prefix(30) {
-            lines.append("  \(a.id == selectedArticle ? "▶" : " ")\(a.isRead ? " " : "●")\(a.isStarred ? "★" : " ") [\(categoryName(a.categoryId) ?? "未分类")\(a.needsReview ? "·待确认" : "")] {\(sourceName(a.source))\(a.highlights.map { " 摘录\($0.count)" } ?? "") 图\(a.imagesSaved)/\(a.images)} \(a.id) \(a.title.prefix(40)) #\(a.tags.joined(separator: " #"))\(snippet(a.id).map { "  ⟨\($0.prefix(60))⟩" } ?? "")")
+            lines.append("  \(selection.contains(a.id) ? "▶" : " ")\(a.isRead ? " " : "●")\(a.isStarred ? "★" : " ") [\(categoryName(a.categoryId) ?? "未分类")\(a.needsReview ? "·待确认" : "")] {\(sourceName(a.source))\(a.highlights.map { " 摘录\($0.count)" } ?? "") 图\(a.imagesSaved)/\(a.images)} \(a.id) \(a.title.prefix(40)) #\(a.tags.joined(separator: " #"))\(snippet(a.id).map { "  ⟨\($0.prefix(60))⟩" } ?? "")")
         }
         // 列表的行高、选中行、滚动位置（新插入的行高度被卡在 24 时一眼能看出来）
         for w in NSApp.windows where w.isVisible && w.title == "拾藏" {
             if let v = w.contentView { Self.dumpTables(v, into: &lines) }
+        }
+        // 剪贴板只在测试改过（/pbset 存了原内容）时才写进快照，不碰用户自己的剪贴板内容
+        if debugSavedPasteboard != nil {
+            let pb = NSPasteboard.general.string(forType: .string) ?? ""
+            lines.append("剪贴板（测试内容）\(pb.split(separator: "\n").count) 行：\(pb.replacingOccurrences(of: "\n", with: " ⏎ ").prefix(300))")
         }
         lines.append("纠正样例 \(taxonomy.corrections.count) 条" + (taxonomy.corrections.last.map { "，最近：《\($0.title.prefix(20))》\($0.from ?? "-") → \($0.to)" } ?? ""))
         try? lines.joined(separator: "\n").write(to: dir.appendingPathComponent("\(name).txt"), atomically: true, encoding: .utf8)
@@ -257,22 +293,43 @@ extension AppModel {
         if let t = v as? NSTableView {
             let heights = (0..<min(t.numberOfRows, 30)).map { String(format: "%.0f", t.rect(ofRow: $0).height) }
             let top = t.rows(in: t.visibleRect).location
-            lines.append("表格 \(t is NSOutlineView ? "outline" : "table") 行=\(t.numberOfRows) 选中=\(t.selectedRow) 顶行=\(top) 滚动=\(Int(t.visibleRect.minY)) 行高=\(heights.joined(separator: " "))")
+            lines.append("表格 \(t is NSOutlineView ? "outline" : "table") 行=\(t.numberOfRows) 选中=\(t.selectedRow) 已选行=\(t.selectedRowIndexes.map(String.init).joined(separator: ",")) 可多选=\(t.allowsMultipleSelection) 顶行=\(top) 滚动=\(Int(t.visibleRect.minY)) 行高=\(heights.joined(separator: " "))")
         }
         for s in v.subviews { dumpTables(s, into: &lines) }
     }
 
     /// 中栏文章列表＝窗口里最靠右的 NSOutlineView（侧栏也是一个）
-    private static func articleTable(_ w: NSWindow) -> NSOutlineView? {
-        var found: [NSOutlineView] = []
-        func walk(_ v: NSView) { if let o = v as? NSOutlineView { found.append(o) }; v.subviews.forEach(walk) }
-        if let v = w.contentView?.superview ?? w.contentView { walk(v) }
-        return found.max { $0.convert($0.bounds, to: nil).minX < $1.convert($1.bounds, to: nil).minX }
-    }
+    private static func articleTable(_ w: NSWindow) -> NSOutlineView? { ListSelectionSync.articleTable() }
 
     private func debugList(_ q: [String: String]) async {
         guard let w = NSApp.windows.first(where: { $0.isVisible && $0.title == "拾藏" }), let t = Self.articleTable(w) else {
             AppLog.shared.say("调试：没找到文章列表"); return
+        }
+        if let rows = q["rows"], q["select"] == "1" {
+            let set = IndexSet(rows.split(separator: ",").compactMap { Int($0) }.filter { $0 < t.numberOfRows })
+            t.selectRowIndexes(set, byExtendingSelection: false)
+            AppLog.shared.say("调试：列表选中 \(set.count) 行"); return
+        }
+        if q["selectall"] == "1" {
+            let fr = w.makeFirstResponder(t)
+            if q["via"] == "table" {
+                t.selectAll(nil)
+                AppLog.shared.say("调试：表格全选（焦点 \(fr)）"); return
+            }
+            // 菜单栏里 ⌘A 那一项（SwiftUI 默认的「编辑 › 全选」），把它的动作沿焦点链发出去
+            func find(_ m: NSMenu) -> NSMenuItem? {
+                for i in m.items {
+                    if i.keyEquivalent == "a", i.keyEquivalentModifierMask == .command { return i }
+                    if let sub = i.submenu, let x = find(sub) { return x }
+                }
+                return nil
+            }
+            guard let item = NSApp.mainMenu.flatMap(find), let action = item.action else {
+                AppLog.shared.say("调试：菜单栏里没有 ⌘A"); return
+            }
+            let ok = w.firstResponder?.tryToPerform(action, with: item) ?? false
+            AppLog.shared.say("调试：菜单「\(item.title)」⌘A → \(NSStringFromSelector(action))，焦点 \(type(of: w.firstResponder!))，处理=\(ok)")
+            return
         }
         if let n = q["scroll"].flatMap(Int.init), n < t.numberOfRows {
             t.scrollRowToVisible(n)
@@ -283,11 +340,97 @@ extension AppModel {
         try? await Task.sleep(for: .milliseconds(300))
         let r = t.rect(ofRow: n)
         let p = t.convert(NSPoint(x: r.midX, y: r.midY), to: nil)
+        if q["menu"] == "1" {
+            guard let e = NSEvent.mouseEvent(with: .rightMouseDown, location: p, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                             windowNumber: w.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1),
+                  let m = t.menu(for: e) else { AppLog.shared.say("调试：第 \(n) 行没有右键菜单"); return }
+            // 照 AppKit 弹右键菜单的顺序走：表格 willOpenMenu → 菜单 willOpen → …… → 菜单 didClose → 表格 didCloseMenu → 再发菜单项的动作
+            t.willOpenMenu(m, with: e)
+            m.delegate?.menuNeedsUpdate?(m)
+            m.delegate?.menuWillOpen?(m)
+            m.update()
+            try? await Task.sleep(for: .milliseconds(200))
+            func dump(_ m: NSMenu, _ pre: String) -> [String] {
+                m.items.flatMap { i -> [String] in
+                    let me = i.isSeparatorItem ? "—" : "\(i.title)\(i.isEnabled ? "" : "(灰)")\(i.state == .on ? "✓" : "")"
+                    return [pre + me] + (i.submenu.map { sub in sub.delegate?.menuNeedsUpdate?(sub); return dump(sub, pre + "  ") } ?? [])
+                }
+            }
+            AppLog.shared.say("调试：第 \(n) 行右键菜单：" + dump(m, "").joined(separator: " | "))
+            m.delegate?.menuDidClose?(m)
+            t.didCloseMenu(m, with: e)
+            if let want = q["pick"] {     // 再点其中一项（含子菜单），走菜单项自己的动作
+                func find(_ m: NSMenu) -> (NSMenu, Int)? {
+                    for (i, it) in m.items.enumerated() {
+                        if it.title == want { return (m, i) }
+                        if let sub = it.submenu, let r = find(sub) { return r }
+                    }
+                    return nil
+                }
+                guard let (pm, i) = find(m) else { AppLog.shared.say("调试：右键菜单里没有「\(want)」"); return }
+                let enabled = pm.items[i].isEnabled
+                pm.performActionForItem(at: i)
+                AppLog.shared.say("调试：右键菜单点了「\(want)」\(enabled ? "" : "（灰的）")")
+            }
+            return
+        }
         if q["select"] == "1" {      // 走表格自己的选中（和鼠标、键盘选中同一条路），看 SwiftUI 把它换成哪个文章 id
             t.selectRowIndexes(IndexSet(integer: n), byExtendingSelection: false)
             AppLog.shared.say("调试：列表选中第 \(n) 行"); return
         }
         AppLog.shared.say("调试：列表第 \(n) 行位置 \(Int(p.x)),\(Int(p.y))")
+    }
+
+    private func debugKey(_ q: [String: String]) {
+        guard let w = NSApp.windows.first(where: { $0.isVisible && $0.title == "拾藏" }), let t = Self.articleTable(w) else { return }
+        w.makeFirstResponder(t)
+        let code = UInt16(q["code"] ?? "51") ?? 51
+        let chars = q["chars"] ?? (code == 51 ? "\u{7f}" : "")
+        let cmd = q["cmd"] == "1"
+        var how = ""
+        for type in [NSEvent.EventType.keyDown, .keyUp] {
+            guard let e = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: cmd ? .command : [],
+                                           timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: w.windowNumber, context: nil,
+                                           characters: chars, charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code) else { continue }
+            if cmd && type == .keyDown {
+                let byWindow = w.performKeyEquivalent(with: e)
+                let byMenu = byWindow ? false : (NSApp.mainMenu?.performKeyEquivalent(with: e) ?? false)
+                how = "窗口=\(byWindow) 菜单=\(byMenu)"
+            } else if !cmd {
+                w.sendEvent(e)
+            }
+        }
+        AppLog.shared.say("调试：按键 code=\(code)\(cmd ? " ⌘" : "") 已发送 \(how) 焦点 \(w.firstResponder.map { "\(type(of: $0))" } ?? "-")")
+    }
+
+    /// 主窗口无障碍树里找按钮（文字＝label 或 title），走 accessibilityPerformPress（SwiftUI 按钮会执行它的 action）
+    private func debugPress(_ q: [String: String]) {
+        guard let w = NSApp.windows.first(where: { $0.isVisible && $0.title == "拾藏" }), let want = q["label"] else { return }
+        var hits: [NSAccessibilityProtocol] = []
+        func walk(_ e: Any, _ depth: Int) {
+            guard depth < 40, let el = e as? NSAccessibilityProtocol else { return }
+            let role = el.accessibilityRole()
+            if role == .button || role == .menuButton || role == .popUpButton,
+               el.accessibilityLabel() == want || el.accessibilityTitle() == want { hits.append(el) }
+            for c in el.accessibilityChildren() ?? [] { walk(c, depth + 1) }
+        }
+        walk(w, 0)
+        let i = Int(q["index"] ?? "0") ?? 0
+        if i < hits.count {
+            let ok = hits[i].accessibilityPerformPress()
+            AppLog.shared.say("调试：按下「\(want)」[\(i)/\(hits.count)] → \(ok)"); return
+        }
+        // SwiftUI 的内容不进进程内无障碍树：再在视图树里找真正的 NSButton（含弹出的确认框窗口），走 performClick
+        var buttons: [NSButton] = []
+        func walkView(_ v: NSView) { if let b = v as? NSButton { buttons.append(b) }; v.subviews.forEach(walkView) }
+        for win in NSApp.windows where win.isVisible { if let v = win.contentView?.superview ?? win.contentView { walkView(v) } }
+        let match = buttons.filter { $0.title == want || $0.accessibilityLabel() == want || $0.alternateTitle == want }
+        guard i < match.count else {
+            let names = buttons.map { $0.title.isEmpty ? ($0.accessibilityLabel() ?? "?") : $0.title }.filter { !$0.isEmpty }
+            AppLog.shared.say("调试：没找到按钮「\(want)」，视图里的按钮：\(names.prefix(40).joined(separator: " / "))"); return
+        }
+        match[i].performClick(nil)
+        AppLog.shared.say("调试：点了按钮「\(want)」[\(i)/\(match.count)]（\(type(of: match[i]))）")
     }
 
     private static func findWebView(_ v: NSView) -> WKWebView? {

@@ -28,7 +28,9 @@ struct MainView: View {
             .frame(minWidth: 340)
             .navigationSplitViewColumnWidth(min: 340, ideal: 420, max: 620)
         } detail: {
-            if let s = model.summary(model.selectedArticle) {
+            if model.selection.count > 1 {
+                MultiSelectionPane(ids: model.selectedIds)
+            } else if let s = model.summary(model.selectedArticle) {
                 ReaderPane(summary: s)
             } else {
                 ContentUnavailableView("选一篇来读", systemImage: "doc.richtext",
@@ -165,9 +167,66 @@ private struct ClipboardBanner: View {
     }
 }
 
+/// 代码改选中值（全选、取消选择、删除后、换视图后只留看得见的）时，macOS 的 List 只更新已经画出来的行：
+/// 屏幕外还没画的行，该取消的不取消、该选的不选，表格上的高亮和真正的选中就对不上了，之后 ⇧ 点按还会把这些行带回来。
+/// 所以每次选中值或列表变了，等 SwiftUI 把看得见的行改完，再把表格的选中行直接对齐成选中值。
+/// 必须等它改完：赶在它前面改表格，它自己记的选中状态就乱了，下一次在表格里点选会被它算成什么都没选。
+/// 鼠标、键盘、⌘A 这些由表格自己发起的变化，两边本来就一致，这里不做任何事。
+@MainActor enum ListSelectionSync {
+    private static var pending = false
+    private static var retries = 0
+    private static var waits = 0
+
+    /// 选中值一变（AppModel.selection 的 didSet）或列表内容一变（中栏 onChange）就排一次
+    static func schedule() {
+        guard !pending else { return }
+        pending = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(30))
+            pending = false
+            align()
+        }
+    }
+
+    private static func align() {
+        let model = AppModel.shared
+        guard let t = articleTable() else { return }
+        let ids = model.filteredArticles.map(\.id)
+        guard t.numberOfRows == ids.count else {          // 表格还没跟上这次的列表：再等几轮，列表真变了中栏还会再排
+            retries += 1
+            if retries <= 20 { schedule() } else { retries = 0 }
+            return
+        }
+        retries = 0
+        let want = IndexSet(ids.indices.filter { model.selection.contains(ids[$0]) })
+        let have = t.selectedRowIndexes
+        guard have != want else { waits = 0; return }
+        // 看得见的行 SwiftUI 自己会改（通常 25ms 内）；还没改完就再等一轮，最多等 10 轮（窗口被挡住时它可能一直不改）
+        if let vis = Range(t.rows(in: t.visibleRect)) {
+            let shown = IndexSet(integersIn: vis)
+            if have.intersection(shown) != want.intersection(shown), waits < 10 { waits += 1; schedule(); return }
+        }
+        waits = 0
+        t.selectRowIndexes(want, byExtendingSelection: false)
+    }
+
+    /// 中栏文章列表＝主窗口（Window id "main"）里唯一允许多选的 NSOutlineView（侧栏、「已选 N 篇」里的标题列表都不能多选）
+    static func articleTable() -> NSOutlineView? {
+        guard let w = NSApp.windows.first(where: { $0.isVisible && $0.identifier?.rawValue == "main" }),
+              let root = w.contentView?.superview ?? w.contentView else { return nil }
+        return find(root)
+    }
+
+    private static func find(_ v: NSView) -> NSOutlineView? {
+        if let o = v as? NSOutlineView, o.allowsMultipleSelection { return o }
+        for s in v.subviews { if let o = find(s) { return o } }
+        return nil
+    }
+}
+
 private struct ArticleListView: View {
     @Environment(AppModel.self) private var model
-    @State private var pendingTrash: ArticleSummary?
+    @State private var pendingTrash: [String] = []
     @State private var rowGen = RowGeneration()
 
     var body: some View {
@@ -178,13 +237,24 @@ private struct ArticleListView: View {
         VStack(spacing: 0) {
             ListHeader(count: list.count, ids: list.map(\.id))
             Divider()
-            List(list, selection: $model.selectedArticle) { s in
+            // 多选：⌘ 点按增减、⇧ 点按连选、⌘A 全选（列表有焦点时）
+            List(list, selection: $model.selection) { s in
                 ArticleRow(summary: s, categoryName: model.categoryName(s.categoryId),
                            snippet: terms.isEmpty ? nil : model.snippet(s.id), terms: terms)
-                    .contextMenu { menu(s) }
                     .id("\(s.id)#\(gen)")
                     .tag(s.id)
             }
+            .contextMenu(forSelectionType: String.self) { ids in
+                // 右键点在选中的行上＝对右栏「已选 N 篇」那一批操作（以选中值为准，不信表格高亮）；点在没选中的行上＝只对那一篇
+                let picked = model.ordered(ids.isDisjoint(with: model.selection) ? ids : model.selection)
+                if picked.count == 1, let s = model.summary(picked[0]) {
+                    menu(s)
+                } else if picked.count > 1 {
+                    BatchActions(ids: picked, style: .menu) { pendingTrash = picked }
+                }
+            }
+            .onDeleteCommand { pendingTrash = model.selectedIds }
+            .onChange(of: list.map(\.id)) { ListSelectionSync.schedule() }
             .overlay {
                 if model.articles.isEmpty {
                     ContentUnavailableView("还没有收藏", systemImage: "tray",
@@ -195,14 +265,7 @@ private struct ArticleListView: View {
                 }
             }
         }
-        .confirmationDialog("把「\(pendingTrash?.title ?? "")」移到废纸篓？", isPresented: Binding(get: { pendingTrash != nil }, set: { if !$0 { pendingTrash = nil } })) {
-            Button("移到废纸篓", role: .destructive) {
-                if let s = pendingTrash { model.trash(s.id) }
-                pendingTrash = nil
-            }
-        } message: {
-            Text("iCloud 里的这篇也会删除（所有设备）。可以从废纸篓找回。")
-        }
+        .trashConfirmation($pendingTrash)
     }
 
     private var emptyText: String {
@@ -233,13 +296,109 @@ private struct ArticleListView: View {
         Divider()
         Button("打开原文") { model.openOriginal(s) }
         Button("在访达中显示") { model.reveal(s) }
-        Button("拷贝链接") {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(s.url, forType: .string)
-        }
+        Button("拷贝链接") { model.copyLinks([s.id]) }.disabled(!AppModel.isWebLink(s.url))
         if s.missingImages > 0 { Button("补抓图片（缺 \(s.missingImages) 张）") { model.repairImages(s.id) } }
         Divider()
-        Button("移到废纸篓…", role: .destructive) { pendingTrash = s }
+        Button("移到废纸篓…", role: .destructive) { pendingTrash = [s.id] }
+    }
+}
+
+extension View {
+    /// 「移到废纸篓？」确认（一篇写标题，多篇写篇数）。ids 为空＝不弹
+    func trashConfirmation(_ ids: Binding<[String]>) -> some View { modifier(TrashConfirmation(ids: ids)) }
+}
+
+private struct TrashConfirmation: ViewModifier {
+    @Environment(AppModel.self) private var model
+    @Binding var ids: [String]
+
+    func body(content: Content) -> some View {
+        let n = ids.count
+        content.confirmationDialog(n == 1 ? "把「\(model.summary(ids[0])?.title ?? "")」移到废纸篓？" : "把选中的 \(n) 篇移到废纸篓？",
+                                   isPresented: Binding(get: { !ids.isEmpty }, set: { if !$0 { ids = [] } })) {
+            Button(n == 1 ? "移到废纸篓" : "移到废纸篓（\(n) 篇）", role: .destructive) {
+                model.trash(ids: ids)
+                ids = []
+            }
+        } message: {
+            Text(n == 1 ? "iCloud 里的这篇也会删除（所有设备）。可以从废纸篓找回。" : "iCloud 里的这 \(n) 篇也会删除（所有设备）。可以从废纸篓找回。")
+        }
+    }
+}
+
+/// 多选时的批量操作：右键菜单（.menu）和右栏「已选 N 篇」面板（.panel）共用一份。
+/// 已读/星标按 Mail 的习惯：选中的里只要有一篇未读就是「标为已读」，全读过了才是「标为未读」
+private struct BatchActions: View {
+    enum Style { case menu, panel }
+    @Environment(AppModel.self) private var model
+    let ids: [String]
+    let style: Style
+    let askTrash: () -> Void
+
+    var body: some View {
+        let items = ids.compactMap { model.summary($0) }
+        let anyUnread = items.contains { !$0.isRead }
+        let anyUnstarred = items.contains { !$0.isStarred }
+        let review = items.filter(\.needsReview).count
+        let links = items.filter { AppModel.isWebLink($0.url) }.count
+        let cats = Set(items.map(\.categoryId))
+        let aiOff = !model.aiReady || !model.classifyEnabled
+        let readBtn = Button { model.setRead(ids: ids, anyUnread) } label: {
+            Label(anyUnread ? "标为已读" : "标为未读", systemImage: anyUnread ? "circle" : "circle.inset.filled")
+        }
+        let starBtn = Button { model.setStarred(ids: ids, anyUnstarred) } label: {
+            Label(anyUnstarred ? "加星标" : "取消星标", systemImage: anyUnstarred ? "star" : "star.slash")
+        }
+        let catMenu = Menu {
+            ForEach(model.taxonomy.active) { c in
+                Button { model.setCategory(ids: ids, c.id) } label: {
+                    if cats == [c.id] { Label(c.name, systemImage: "checkmark") } else { Text(c.name) }
+                }
+            }
+            if items.contains(where: { $0.state.userCategory != nil && $0.ai != nil }) {
+                Divider()
+                Button("恢复跟随 AI") { model.setCategory(ids: ids, nil) }
+            }
+        } label: {
+            Label(cats.count == 1 ? "分类：\(cats.first!.flatMap { model.categoryName($0) } ?? "未分类")" : "分类（\(cats.count) 种）",
+                  systemImage: "folder")
+        }
+        let confirmBtn = Button { model.confirmCategory(ids: ids) } label: {
+            Label("确认分类（\(review) 篇）", systemImage: "checkmark.circle")
+        }
+        let reclassifyBtn = Button { model.reclassify(ids: ids) } label: { Label("重新分类", systemImage: "sparkles") }
+            .disabled(aiOff)
+            .help(aiOff ? "AI 分类没开或没设置好" : "交给 AI 重新分类这 \(ids.count) 篇")
+        let copyBtn = Button { model.copyLinks(ids) } label: {
+            Label(links == items.count ? "拷贝 \(links) 个链接" : "拷贝 \(links) 个链接（\(items.count - links) 篇剪藏没有）", systemImage: "link")
+        }
+        .disabled(links == 0)
+        let trashBtn = Button(role: .destructive, action: askTrash) { Label("移到废纸篓…", systemImage: "trash") }
+
+        switch style {
+        case .menu:
+            Text("已选 \(items.count) 篇")
+            readBtn
+            starBtn
+            catMenu
+            if review > 0 { confirmBtn }
+            reclassifyBtn
+            Divider()
+            copyBtn
+            Divider()
+            trashBtn
+        case .panel:
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) { readBtn; starBtn }
+                HStack(spacing: 8) {
+                    catMenu.menuStyle(.button).fixedSize()
+                    if review > 0 { confirmBtn }
+                    reclassifyBtn
+                }
+                HStack(spacing: 8) { copyBtn; trashBtn }
+            }
+            .controlSize(.large)
+        }
     }
 }
 
@@ -257,6 +416,9 @@ private struct ListHeader: View {
             Spacer(minLength: 4)
             ClassifyBadge()
             Menu {
+                Button("全选（⌘A）") { model.selectAll() }.disabled(count == 0)
+                Button("取消选择") { model.selection = [] }.disabled(model.selection.isEmpty)
+                Divider()
                 Button("全部标为已读") { model.markAllRead(ids) }.disabled(count == 0)
             } label: { Image(systemName: "ellipsis.circle") }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
@@ -477,6 +639,67 @@ private struct QueueRow: View {
 
 // MARK: 阅读区
 
+/// 选了多篇时的右栏：篇数、概况、批量操作按钮、选中的标题列表
+private struct MultiSelectionPane: View {
+    @Environment(AppModel.self) private var model
+    let ids: [String]
+    @State private var pendingTrash: [String] = []
+
+    var body: some View {
+        let items = ids.compactMap { model.summary($0) }
+        let unread = items.filter { !$0.isRead }.count
+        let starred = items.filter(\.isStarred).count
+        let review = items.filter(\.needsReview).count
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Image(systemName: "checklist").font(.title).foregroundStyle(.tint)
+                Text("已选 \(items.count) 篇").font(.largeTitle.weight(.semibold))
+                Spacer()
+                Button("取消选择") { model.selection = [] }.buttonStyle(.link)
+            }
+            Text(([unread > 0 ? "未读 \(unread)" : "都读过了", starred > 0 ? "星标 \(starred)" : nil, review > 0 ? "待确认 \(review)" : nil] as [String?])
+                    .compactMap { $0 }.joined(separator: " · "))
+                .foregroundStyle(.secondary)
+            BatchActions(ids: ids, style: .panel) { pendingTrash = ids }
+            Divider()
+            List(items) { s in
+                HStack(spacing: 8) {
+                    Circle().fill(s.isRead ? Color.clear : Color.accentColor).frame(width: 6, height: 6)
+                    Text(s.title).lineLimit(1)
+                    if s.isStarred { Image(systemName: "star.fill").font(.caption2).foregroundStyle(.yellow) }
+                    Spacer(minLength: 8)
+                    Text(model.categoryName(s.categoryId) ?? "未分类").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)
+            Text("⌘ 点按：加选或去掉一篇　⇧ 点按：连续选　⌘A：全选　Delete：移到废纸篓")
+                .font(.caption).foregroundStyle(.tertiary)
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                let anyUnstarred = items.contains { !$0.isStarred }
+                let anyUnread = unread > 0
+                Button { model.setStarred(ids: ids, anyUnstarred) } label: {
+                    Label(anyUnstarred ? "星标" : "取消星标", systemImage: anyUnstarred ? "star" : "star.fill")
+                }
+                .help(anyUnstarred ? "选中的都加星标（⇧⌘L）" : "选中的都取消星标（⇧⌘L）")
+                .keyboardShortcut("l", modifiers: [.command, .shift])
+                Button { model.setRead(ids: ids, anyUnread) } label: {
+                    Label(anyUnread ? "标为已读" : "标为未读", systemImage: anyUnread ? "circle" : "circle.inset.filled")
+                }
+                .help(anyUnread ? "选中的都标为已读（⇧⌘U）" : "选中的都标为未读（⇧⌘U）")
+                .keyboardShortcut("u", modifiers: [.command, .shift])
+                Button(role: .destructive) { pendingTrash = ids } label: { Label("删除", systemImage: "trash") }
+                    .help("选中的 \(items.count) 篇移到废纸篓")
+            }
+        }
+        .trashConfirmation($pendingTrash)
+    }
+}
+
 private struct ReaderPane: View {
     @Environment(AppModel.self) private var model
     let summary: ArticleSummary
@@ -518,11 +741,7 @@ private struct ReaderPane: View {
                     .help("移到废纸篓")
             }
         }
-        .confirmationDialog("把「\(summary.title)」移到废纸篓？", isPresented: $confirmTrash) {
-            Button("移到废纸篓", role: .destructive) { model.trash(summary.id) }
-        } message: {
-            Text("iCloud 里的这篇也会删除（所有设备）。可以从废纸篓找回。")
-        }
+        .trashConfirmation(Binding(get: { confirmTrash ? [summary.id] : [] }, set: { confirmTrash = !$0.isEmpty }))
     }
 }
 

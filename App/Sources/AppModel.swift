@@ -28,7 +28,10 @@ final class AppModel {
     var articles: [ArticleSummary] = []
     var queue: [QueueEntry] = []
     var sidebar: SidebarItem? = .all
-    var selectedArticle: ArticleSummary.ID?
+    /// 中栏选中的文章（⌘ 点按、⇧ 点按、⌘A 可以选多篇）
+    var selection = Set<ArticleSummary.ID>() {
+        didSet { if selection != oldValue { ListSelectionSync.schedule() } }     // 屏幕外的行 SwiftUI 不管，见 ListSelectionSync
+    }
     var search = ""
     var searchHits: [SearchHit]?                 // nil＝没在搜；有值＝按相关度排好的结果
     var clipboardOffer = false
@@ -153,8 +156,35 @@ final class AppModel {
         taxonomy = await idx.currentTaxonomy()
         tagCounts = await idx.tagCounts()
         classifyStatus = await processor.classifier.currentStatus
-        if let s = selectedArticle, !articles.contains(where: { $0.id == s }) { selectedArticle = nil }
+        let ids = Set(articles.map(\.id))
+        if !selection.isSubset(of: ids) { selection.formIntersection(ids) }
         if !search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { await runSearch() }
+        pruneMultiSelection()
+    }
+
+    /// 只选了一篇时就是这一篇（阅读区显示它）；没选或选了多篇时为 nil
+    var selectedArticle: ArticleSummary.ID? {
+        get { selection.count == 1 ? selection.first : nil }
+        set { selection = newValue.map { [$0] } ?? [] }
+    }
+
+    /// 选中的文章，按中栏列表的顺序（不在当前列表里的排在后面）
+    var selectedIds: [String] { ordered(selection) }
+
+    func ordered(_ ids: Set<String>) -> [String] {
+        let shown = filteredArticles.map(\.id).filter(ids.contains)
+        let rest = articles.map(\.id).filter { ids.contains($0) && !shown.contains($0) }
+        return shown + rest
+    }
+
+    func selectAll() { selection = Set(filteredArticles.map(\.id)) }
+
+    /// 多选时只保留当前列表里看得见的（换视图、搜索收窄后，看不见的文章不应被批量操作带上）。
+    /// 只选一篇时照旧：换视图后阅读区还停在那一篇
+    private func pruneMultiSelection() {
+        guard selection.count > 1 else { return }
+        let keep = selection.intersection(filteredArticles.map(\.id))
+        if keep != selection { selection = keep }
     }
 
     // MARK: 搜索
@@ -166,6 +196,7 @@ final class AppModel {
         let hits = await processor.index.search(q)
         guard q == search.trimmingCharacters(in: .whitespacesAndNewlines) else { return }    // 等结果期间又改了
         searchHits = hits
+        pruneMultiSelection()
     }
 
     var searchTerms: [String] { SearchText.query(search)?.terms ?? [] }
@@ -181,6 +212,7 @@ final class AppModel {
         guard s != sidebar else { return }
         sidebar = s
         sticky = []
+        pruneMultiSelection()
     }
 
     /// 跳到某一篇（必要时先切到「全部」）。要等列表把新行画出来再选：同一帧里插入并选中，
@@ -426,17 +458,56 @@ final class AppModel {
     func retry(_ id: String) { Task { await processor.retry(id) } }
     func removeQueued(_ id: String) { Task { await processor.removeItem(id) } }
 
-    func trash(_ id: String) {
+    func trash(_ id: String) { trash(ids: [id]) }
+
+    /// 移到废纸篓（一篇或多篇）。多篇时做完给个回执；有失败的报失败篇数和第一条原因
+    func trash(ids: [String]) {
+        guard !ids.isEmpty else { return }
         Task {
-            do {
-                try await processor.trash(id)
-                AppLog.shared.say("移到废纸篓 \(id)")
-                if selectedArticle == id { selectedArticle = nil }
-            } catch {
-                hud.show(title: "删除失败", detail: error.localizedDescription, symbol: "xmark.octagon.fill", tint: .red)
+            var done = 0
+            var firstError: String?
+            for id in ids {
+                do {
+                    try await processor.trash(id)
+                    done += 1
+                    selection.remove(id)
+                    sticky.remove(id)
+                } catch {
+                    if firstError == nil { firstError = error.localizedDescription }
+                }
+            }
+            AppLog.shared.say(ids.count == 1 ? "移到废纸篓 \(ids[0])\(done == 1 ? "" : " 失败")" : "移到废纸篓 \(done)/\(ids.count) 篇")
+            if let firstError {
+                hud.show(title: ids.count == 1 ? "删除失败" : "\(ids.count - done) 篇删除失败", detail: firstError, symbol: "xmark.octagon.fill", tint: .red)
+            } else if ids.count > 1 {
+                hud.show(title: "已移到废纸篓", detail: "\(done) 篇，可以从废纸篓找回", symbol: "trash.fill", tint: .secondary)
             }
             await reload()
         }
+    }
+
+    /// 拷贝原文链接（多篇一行一个）。没有原文链接的剪藏跳过。这一版剪贴板是自己写的，切回拾藏时不出「收藏」横幅
+    func copyLinks(_ ids: [String]) {
+        let links = ids.compactMap { summary($0)?.url }.filter(Self.isWebLink)
+        guard !links.isEmpty else {
+            hud.show(title: "没有可拷贝的链接", detail: ids.count == 1 ? "这篇剪藏没有原文链接" : "选中的都是没有原文链接的剪藏",
+                     symbol: "link.badge.plus", tint: .orange)
+            return
+        }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(links.joined(separator: "\n"), forType: .string)
+        handledChangeCount = pb.changeCount
+        capturedChangeCount = pb.changeCount
+        clipboardOffer = false
+        let skipped = ids.count - links.count
+        hud.show(title: links.count == 1 ? "已拷贝链接" : "已拷贝 \(links.count) 个链接",
+                 detail: skipped > 0 ? "\(skipped) 篇剪藏没有原文链接，已跳过" : nil, symbol: "link", tint: .green)
+    }
+
+    nonisolated static func isWebLink(_ s: String) -> Bool {
+        guard let u = URL(string: s), let scheme = u.scheme?.lowercased(), u.host?.isEmpty == false else { return false }
+        return scheme == "https" || scheme == "http"
     }
 
     func repairImages(_ id: String) {
@@ -470,12 +541,50 @@ final class AppModel {
         setRead(id, true)
     }
 
-    func markAllRead(_ ids: [String]) {
-        let todo = ids.filter { summary($0)?.isRead == false }
-        guard !todo.isEmpty else { return }
-        sticky.formUnion(todo)
+    func markAllRead(_ ids: [String]) { setRead(ids: ids, true) }
+
+    // MARK: 批量（多选）：一次改完再刷新一次列表；改过的文章先留在当前视图里
+
+    private func mutateMany(_ ids: [String], _ f: @escaping @Sendable (LibraryIndex, [String]) async -> Void) {
+        guard !ids.isEmpty else { return }
+        sticky.formUnion(ids)
         let idx = processor.index
-        Task { await idx.setRead(todo, true); await reload() }
+        Task {
+            await f(idx, ids)
+            await reload()
+        }
+    }
+
+    func setRead(ids: [String], _ v: Bool) {
+        let todo = ids.filter { summary($0).map { $0.isRead != v } ?? false }
+        if ids.count > 1 { AppLog.shared.say("批量标为\(v ? "已读" : "未读") \(todo.count) 篇") }
+        mutateMany(todo) { await $0.setRead($1, v) }
+    }
+
+    func setStarred(ids: [String], _ v: Bool) {
+        let todo = ids.filter { summary($0).map { $0.isStarred != v } ?? false }
+        if ids.count > 1 { AppLog.shared.say("批量\(v ? "加星标" : "取消星标") \(todo.count) 篇") }
+        mutateMany(todo) { idx, list in for id in list { await idx.setStarred(id, v) } }
+    }
+
+    /// cat = nil：恢复跟随 AI
+    func setCategory(ids: [String], _ cat: String?) {
+        guard ids.count > 1 else { if let id = ids.first { setCategory(id, cat) }; return }
+        AppLog.shared.say("批量手动分类 \(ids.count) 篇 → \(cat.flatMap { taxonomy.name($0) } ?? "跟随 AI")")
+        mutateMany(ids) { idx, list in for id in list { await idx.setCategory(id, cat) } }
+    }
+
+    func confirmCategory(ids: [String]) {
+        let todo = ids.filter { summary($0)?.needsReview == true }
+        if ids.count > 1 { AppLog.shared.say("批量确认分类 \(todo.count) 篇") }
+        mutateMany(todo) { idx, list in for id in list { await idx.confirmCategory(id) } }
+    }
+
+    func reclassify(ids: [String]) {
+        guard !ids.isEmpty else { return }
+        let c = processor.classifier
+        AppLog.shared.say(ids.count == 1 ? "重新分类 \(ids[0])" : "批量重新分类 \(ids.count) 篇")
+        Task { await c.enqueue(ids, force: true) }
     }
 
     /// cat = nil：恢复跟随 AI
@@ -496,11 +605,7 @@ final class AppModel {
 
     func removeTag(_ s: ArticleSummary, _ t: String) { setTags(s.id, s.tags.filter { $0 != t }) }
 
-    func reclassify(_ id: String) {
-        let c = processor.classifier
-        AppLog.shared.say("重新分类 \(id)")
-        Task { await c.enqueue([id], force: true) }
-    }
+    func reclassify(_ id: String) { reclassify(ids: [id]) }
 
     func reclassifyAll() {
         let c = processor.classifier
