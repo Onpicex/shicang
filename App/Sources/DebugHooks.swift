@@ -20,6 +20,7 @@ import ShicangCore
 ///   shicang://debug/clip-confirm?title=   点剪藏小窗的「保存」（可先改标题）  /  shicang://debug/clip-cancel 点「取消」
 ///   shicang://debug/ai-draft?provider=&base=&model=&fallbacks=&key=   改设置页 AI 表单（key 只用假密钥测试）
 ///   shicang://debug/ai-draft-test | ai-draft-models | ai-draft-save | ai-draft-clearkey   点表单上的按钮
+///   shicang://debug/list?scroll=N | list?row=N&select=1   中栏文章列表：滚到第 N 行 / 让表格选中第 N 行（快照里看换成了哪个文章 id）
 extension AppModel {
     func handleDebug(_ u: URL, _ q: [String: String]) {
         guard let root = testRoot else { AppLog.shared.say("忽略调试指令（非测试模式）"); return }
@@ -81,6 +82,7 @@ extension AppModel {
         case "/pbset": debugSetPasteboard(q)
         case "/pbrestore": debugRestorePasteboard()
         case "/reader": Task { await debugReader(q) }
+        case "/list": Task { await debugList(q) }
         case "/clip":
             route(PasteboardContent(text: q["text"] ?? "", html: q["html"], sourceURL: q["url"]), via: "debug")
         case "/clip-confirm":
@@ -150,6 +152,10 @@ extension AppModel {
         lines.append("搜索「\(search)」hits=\(searchHits.map { "\($0.count)" } ?? "nil") 列表=\(filteredArticles.count) 篇")
         for a in filteredArticles.prefix(30) {
             lines.append("  \(a.id == selectedArticle ? "▶" : " ")\(a.isRead ? " " : "●")\(a.isStarred ? "★" : " ") [\(categoryName(a.categoryId) ?? "未分类")\(a.needsReview ? "·待确认" : "")] {\(sourceName(a.source))\(a.highlights.map { " 摘录\($0.count)" } ?? "") 图\(a.imagesSaved)/\(a.images)} \(a.id) \(a.title.prefix(40)) #\(a.tags.joined(separator: " #"))\(snippet(a.id).map { "  ⟨\($0.prefix(60))⟩" } ?? "")")
+        }
+        // 列表的行高、选中行、滚动位置（新插入的行高度被卡在 24 时一眼能看出来）
+        for w in NSApp.windows where w.isVisible && w.title == "拾藏" {
+            if let v = w.contentView { Self.dumpTables(v, into: &lines) }
         }
         lines.append("纠正样例 \(taxonomy.corrections.count) 条" + (taxonomy.corrections.last.map { "，最近：《\($0.title.prefix(20))》\($0.from ?? "-") → \($0.to)" } ?? ""))
         try? lines.joined(separator: "\n").write(to: dir.appendingPathComponent("\(name).txt"), atomically: true, encoding: .utf8)
@@ -245,6 +251,43 @@ extension AppModel {
         let f = el.accessibilityFrame()
         out.append(String(repeating: "  ", count: depth) + role + " " + bits.joined(separator: " ") + " @\(Int(f.minX)),\(Int(f.minY)) \(Int(f.width))x\(Int(f.height))")
         for c in el.accessibilityChildren() ?? [] { dumpAX(c, depth: depth + 1, into: &out) }
+    }
+
+    private static func dumpTables(_ v: NSView, into lines: inout [String]) {
+        if let t = v as? NSTableView {
+            let heights = (0..<min(t.numberOfRows, 30)).map { String(format: "%.0f", t.rect(ofRow: $0).height) }
+            let top = t.rows(in: t.visibleRect).location
+            lines.append("表格 \(t is NSOutlineView ? "outline" : "table") 行=\(t.numberOfRows) 选中=\(t.selectedRow) 顶行=\(top) 滚动=\(Int(t.visibleRect.minY)) 行高=\(heights.joined(separator: " "))")
+        }
+        for s in v.subviews { dumpTables(s, into: &lines) }
+    }
+
+    /// 中栏文章列表＝窗口里最靠右的 NSOutlineView（侧栏也是一个）
+    private static func articleTable(_ w: NSWindow) -> NSOutlineView? {
+        var found: [NSOutlineView] = []
+        func walk(_ v: NSView) { if let o = v as? NSOutlineView { found.append(o) }; v.subviews.forEach(walk) }
+        if let v = w.contentView?.superview ?? w.contentView { walk(v) }
+        return found.max { $0.convert($0.bounds, to: nil).minX < $1.convert($1.bounds, to: nil).minX }
+    }
+
+    private func debugList(_ q: [String: String]) async {
+        guard let w = NSApp.windows.first(where: { $0.isVisible && $0.title == "拾藏" }), let t = Self.articleTable(w) else {
+            AppLog.shared.say("调试：没找到文章列表"); return
+        }
+        if let n = q["scroll"].flatMap(Int.init), n < t.numberOfRows {
+            t.scrollRowToVisible(n)
+            AppLog.shared.say("调试：列表滚到第 \(n) 行，顶行 \(t.rows(in: t.visibleRect).location)")
+        }
+        guard let n = q["row"].flatMap(Int.init), n < t.numberOfRows else { return }
+        t.scrollRowToVisible(n)
+        try? await Task.sleep(for: .milliseconds(300))
+        let r = t.rect(ofRow: n)
+        let p = t.convert(NSPoint(x: r.midX, y: r.midY), to: nil)
+        if q["select"] == "1" {      // 走表格自己的选中（和鼠标、键盘选中同一条路），看 SwiftUI 把它换成哪个文章 id
+            t.selectRowIndexes(IndexSet(integer: n), byExtendingSelection: false)
+            AppLog.shared.say("调试：列表选中第 \(n) 行"); return
+        }
+        AppLog.shared.say("调试：列表第 \(n) 行位置 \(Int(p.x)),\(Int(p.y))")
     }
 
     private static func findWebView(_ v: NSView) -> WKWebView? {

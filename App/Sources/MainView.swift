@@ -148,14 +148,33 @@ private struct ClipboardBanner: View {
 
 // MARK: 文章列表
 
+/// 中栏列表行身份的「代」。
+/// macOS 的 List（底层是 NSOutlineView）往非空列表里插入没显示过的行时，新行停在默认高度 24pt，
+/// 只露出一行标题，切到别的页面再切回来才会重新量。显示的列表里一出现新文章，代号加一，
+/// 所有行一起换身份（id 带代号），列表按整表换新处理，每一行都重新量高度。
+/// 选中值用 .tag 固定为文章 id，不受代号影响。只是从列表里移除的变化不加代号。
+@MainActor private final class RowGeneration {
+    private var shown: Set<String> = []
+    private(set) var value = 0
+
+    func update(_ ids: [String]) -> Int {
+        let now = Set(ids)
+        if !shown.isEmpty, !now.isSubset(of: shown) { value &+= 1 }
+        shown = now
+        return value
+    }
+}
+
 private struct ArticleListView: View {
     @Environment(AppModel.self) private var model
     @State private var pendingTrash: ArticleSummary?
+    @State private var rowGen = RowGeneration()
 
     var body: some View {
         @Bindable var model = model
         let list = model.filteredArticles
         let terms = model.searchHits == nil ? [] : model.searchTerms
+        let gen = rowGen.update(list.map(\.id))
         VStack(spacing: 0) {
             ListHeader(count: list.count, ids: list.map(\.id))
             Divider()
@@ -163,6 +182,8 @@ private struct ArticleListView: View {
                 ArticleRow(summary: s, categoryName: model.categoryName(s.categoryId),
                            snippet: terms.isEmpty ? nil : model.snippet(s.id), terms: terms)
                     .contextMenu { menu(s) }
+                    .id("\(s.id)#\(gen)")
+                    .tag(s.id)
             }
             .overlay {
                 if model.articles.isEmpty {
