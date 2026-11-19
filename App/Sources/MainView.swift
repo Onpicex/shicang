@@ -224,6 +224,28 @@ private struct ClipboardBanner: View {
     }
 }
 
+/// 选了多篇（含全选）时按 Esc＝取消选择。只选一篇时不管（阅读区照旧）；正在输入（搜索框等）时 Esc 留给输入框；
+/// 弹着确认框时也不管。用 App 内按键监听，不用 .keyboardShortcut(.escape)：快捷键会赶在搜索框前面把 Esc 抢走。
+@MainActor enum EscapeDeselect {
+    static func install() {
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
+            let code = e.keyCode, flags = e.modifierFlags, win = e.windowNumber
+            let used = MainActor.assumeIsolated { handle(keyCode: code, flags: flags, windowNumber: win) }
+            return used ? nil : e
+        }
+    }
+
+    private static func handle(keyCode: UInt16, flags: NSEvent.ModifierFlags, windowNumber: Int) -> Bool {
+        guard keyCode == 53, flags.intersection([.command, .option, .control, .shift]).isEmpty,
+              let w = NSApp.window(withWindowNumber: windowNumber), w.identifier?.rawValue == "main",
+              w.attachedSheet == nil, NSApp.modalWindow == nil,
+              !(w.firstResponder is NSText),                 // 搜索框在输入时第一响应者是它的字段编辑器（NSTextView）
+              AppModel.shared.selection.count > 1 else { return false }
+        AppModel.shared.selection = []
+        return true
+    }
+}
+
 private struct ArticleListView: View {
     @Environment(AppModel.self) private var model
     @State private var pendingTrash: [String] = []
@@ -417,7 +439,7 @@ private struct ListHeader: View {
             ClassifyBadge()
             Menu {
                 Button("全选（⌘A）") { model.selectAll() }.disabled(count == 0)
-                Button("取消选择") { model.selection = [] }.disabled(model.selection.isEmpty)
+                Button(model.selection.count > 1 ? "取消选择（Esc）" : "取消选择") { model.selection = [] }.disabled(model.selection.isEmpty)
                 Divider()
                 Button("全部标为已读") { model.markAllRead(ids) }.disabled(count == 0)
             } label: { Image(systemName: "ellipsis.circle") }
@@ -655,7 +677,7 @@ private struct MultiSelectionPane: View {
                 Image(systemName: "checklist").font(.title).foregroundStyle(.tint)
                 Text("已选 \(items.count) 篇").font(.largeTitle.weight(.semibold))
                 Spacer()
-                Button("取消选择") { model.selection = [] }.buttonStyle(.link)
+                Button("取消选择") { model.selection = [] }.buttonStyle(.link).help("Esc")
             }
             Text(([unread > 0 ? "未读 \(unread)" : "都读过了", starred > 0 ? "星标 \(starred)" : nil, review > 0 ? "待确认 \(review)" : nil] as [String?])
                     .compactMap { $0 }.joined(separator: " · "))
@@ -673,7 +695,7 @@ private struct MultiSelectionPane: View {
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
-            Text("⌘ 点按：加选或去掉一篇　⇧ 点按：连续选　⌘A：全选　Delete：移到废纸篓")
+            Text("⌘ 点按：加选或去掉一篇　⇧ 点按：连续选　⌘A：全选　Delete：移到废纸篓　Esc：取消选择")
                 .font(.caption).foregroundStyle(.tertiary)
         }
         .padding(24)

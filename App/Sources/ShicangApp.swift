@@ -54,6 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { AppModel.shared.checkClipboardOffer() }
         }
+        EscapeDeselect.install()
         AppLog.shared.say("启动完成 pid=\(ProcessInfo.processInfo.processIdentifier)")
     }
 

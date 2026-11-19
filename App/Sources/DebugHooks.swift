@@ -9,6 +9,7 @@ import ShicangCore
 ///                         &articles=<id>,<id>  /  &indexes=0,2,5  多选（直接改选中集合）  /  &all=1 全选  /  &none=1 取消选择
 ///   shicang://debug/batch?op=read|unread|star|unstar|category&cat=<id>|ai|confirm|reclassify|copy|trash   对选中的多篇批量操作（trash 不弹确认）
 ///   shicang://debug/key?code=51 | key?code=0&chars=a&cmd=1   列表先成为焦点，再往窗口发一次按键（51＝Delete；带 cmd 的走窗口和菜单栏的快捷键匹配）
+///     &via=app：不带 cmd 的按键改走 NSApp.sendEvent（和真按键一样先过 App 内按键监听，如 Esc 取消多选）；&focus=search：焦点放到搜索框而不是列表
 ///   shicang://debug/press?label=<按钮文字>&index=<n>   在主窗口的无障碍树里找第 n 个文字相符的按钮，走它自己的按下动作（和真人点一样进按钮的 action）
 ///   shicang://debug/state?article=<id>&read=0|1&star=0|1&category=<id>|ai&confirm=1&tags=a,b|ai&addtag=x&reclassify=1
 ///   shicang://debug/tax?op=add|edit|delete|move|tagrename|tagdelete&id=&name=&note=&into=&by=&old=&new=&tag=
@@ -383,7 +384,11 @@ extension AppModel {
 
     private func debugKey(_ q: [String: String]) {
         guard let w = NSApp.windows.first(where: { $0.isVisible && $0.title == "拾藏" }), let t = Self.articleTable(w) else { return }
-        w.makeFirstResponder(t)
+        if q["focus"] == "search", let f = Self.searchField(w.contentView?.superview ?? w.contentView) {
+            w.makeFirstResponder(f)
+        } else {
+            w.makeFirstResponder(t)
+        }
         let code = UInt16(q["code"] ?? "51") ?? 51
         let chars = q["chars"] ?? (code == 51 ? "\u{7f}" : "")
         let cmd = q["cmd"] == "1"
@@ -397,10 +402,17 @@ extension AppModel {
                 let byMenu = byWindow ? false : (NSApp.mainMenu?.performKeyEquivalent(with: e) ?? false)
                 how = "窗口=\(byWindow) 菜单=\(byMenu)"
             } else if !cmd {
-                w.sendEvent(e)
+                if q["via"] == "app" { NSApp.sendEvent(e) } else { w.sendEvent(e) }
             }
         }
-        AppLog.shared.say("调试：按键 code=\(code)\(cmd ? " ⌘" : "") 已发送 \(how) 焦点 \(w.firstResponder.map { "\(type(of: $0))" } ?? "-")")
+        AppLog.shared.say("调试：按键 code=\(code)\(cmd ? " ⌘" : "") 已发送 \(how) 焦点 \(w.firstResponder.map { "\(type(of: $0))" } ?? "-") 选中 \(AppModel.shared.selection.count) 篇")
+    }
+
+    private static func searchField(_ v: NSView?) -> NSSearchField? {
+        guard let v else { return nil }
+        if let f = v as? NSSearchField { return f }
+        for s in v.subviews { if let f = searchField(s) { return f } }
+        return nil
     }
 
     /// 主窗口无障碍树里找按钮（文字＝label 或 title），走 accessibilityPerformPress（SwiftUI 按钮会执行它的 action）
