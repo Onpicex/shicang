@@ -132,6 +132,15 @@ import SwiftSoup
         let two = Clip.textBlocks("func a() {\n    return 1\n}\n\nfunc b() {\n    return 2\n}")
         #expect(two.count == 1 && two[0].type == .code)
         #expect(two[0].text == "func a() {\n    return 1\n}\n\nfunc b() {\n    return 2\n}")
+        // 作者自己写的 ``` 围栏（公众号短文里常见）：围栏里原样保留；没闭合的当普通文字
+        let fenced = Clip.textBlocks("例子一\n```\n这段要原样复制：\n  第二行 <目录>/ \n\n第三行\n```\n后面的文字。\n\n~~~~Python\nprint(1)\n~~~~\n```\n```\n\n```\n没闭合")
+        #expect(Self.summary(fenced) == [
+            "paragraph 例子一",
+            "code[-] 这段要原样复制：\n  第二行 <目录>/\n\n第三行",
+            "paragraph 后面的文字。",
+            "code[python] print(1)",
+            "paragraph ```\n没闭合",
+        ])
     }
 
     /// 阅读器代码卡片：「复制」链接带原文；注释变淡；HTML 转义

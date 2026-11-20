@@ -162,7 +162,7 @@ public enum Clip {
         return r >= 0.6 && r <= 1.5
     }
 
-    /// 纯文字分段：空行分段，段内换行保留
+    /// 纯文字分段：空行分段，段内换行保留；``` 围栏当代码块
     static func textBlocks(_ text: String) -> [Block] {
         var out: [Block] = []
         var cur: [String] = []
@@ -190,9 +190,32 @@ public enum Clip {
                 }
             }
         }
+        // 作者自己写的 ``` 围栏 → 代码块（语言取围栏后的词）；没闭合就当普通文字
+        var fence: (marker: String, lang: String?, lines: [String])?
         for line in text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n").components(separatedBy: "\n") {
-            let t = line.replacingOccurrences(of: "\t", with: "    ")
-            if t.trimmingCharacters(in: .whitespaces).isEmpty { flush() } else { cur.append(String(t.reversed().drop(while: { $0 == " " }).reversed())) }
+            let t = String(line.replacingOccurrences(of: "\t", with: "    ").reversed().drop(while: { $0 == " " }).reversed())
+            let trimmed = t.trimmingCharacters(in: .whitespaces)
+            if var f = fence {
+                if trimmed.hasPrefix(f.marker), trimmed.allSatisfy({ $0 == f.marker.first }) {
+                    if f.lines.contains(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) {
+                        out.append(.code(f.lines.joined(separator: "\n"), language: f.lang))
+                    }
+                    lastWasCode = false; fence = nil
+                } else { f.lines.append(t); fence = f }
+                continue
+            }
+            if let m = trimmed.range(of: #"^(`{3,}|~{3,})\s*[A-Za-z0-9_+#.-]*$"#, options: .regularExpression), m.lowerBound == trimmed.startIndex {
+                flush()
+                let marker = String(trimmed.prefix { $0 == trimmed.first })
+                let lang = trimmed.dropFirst(marker.count).trimmingCharacters(in: .whitespaces).lowercased()
+                fence = (marker, lang.isEmpty ? nil : lang, [])
+                continue
+            }
+            if trimmed.isEmpty { flush() } else { cur.append(t) }
+        }
+        if let f = fence {                      // 没闭合：围栏行连同后面的内容按普通文字处理
+            cur.append(f.marker + (f.lang ?? ""))
+            for l in f.lines { if l.trimmingCharacters(in: .whitespaces).isEmpty { flush() } else { cur.append(l) } }
         }
         flush()
         return out
