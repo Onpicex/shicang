@@ -20,6 +20,8 @@ public struct InboxItem: Codable, Sendable, Identifiable, Hashable {
     public var lastError: String?
     public var lastAttemptAt: Date?
     public var nextRetryAt: Date?       // 自动重试时间（暂时性错误才有）
+    public var owner: String?           // 收藏的那台 Mac 的设备 ID：它先处理，别的 Mac 等一会儿才接手（旧版条目没有）
+    public var triedBy: [String]?       // 试过但失败的设备 ID（每台 Mac 至少各试一次）
 
     public var displayTitle: String {
         let u = URL(string: url)
@@ -107,7 +109,7 @@ public struct Inbox: Sendable {
         }
         return InboxItem(id: Capture.hash(t.key), key: t.key, source: t.source, url: t.url.absoluteString,
                          capturedURL: t.capturedURL, shareText: share, highlight: hl, via: via, device: device ?? self.device.name,
-                         capturedAt: capturedAt)
+                         capturedAt: capturedAt, owner: self.device.id)
     }
 
     // MARK: 认领

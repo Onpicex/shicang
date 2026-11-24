@@ -18,6 +18,7 @@ public struct QueueEntry: Sendable, Identifiable, Hashable {
     public var item: InboxItem
     public var running: Bool
     public var claimedBy: String?     // 别的设备正在处理
+    public var waiting: Bool = false  // 别的 Mac 收藏的，这台先等它处理
     public var id: String { item.id }
 }
 
@@ -32,6 +33,13 @@ public actor Processor {
     public var timeoutPerItem: Double = 120
 
     private var running = Set<String>()
+    let registry: DeviceRegistry
+    /// 别的 Mac 收藏的条目，这台等多久才接手（测试里调小）
+    public private(set) var grace: TimeInterval = Turn.defaultGrace
+    public func setGrace(_ v: TimeInterval) { grace = v }
+    private var firstSeen: [String: Date] = [:]        // 条目 id → 这台第一次看到的时间
+    private var foreignSeen: [String: Date] = [:]      // 外来文件路径 → 这台第一次看到的时间
+    private var wakeAt: Date?
     private var ingesting = false
     private var handler: (@Sendable (ProcessorEvent) -> Void)?
     private var imagePlan: ImageRetryPlan
@@ -45,6 +53,7 @@ public actor Processor {
         index = LibraryIndex(paths: paths, deviceId: device.id)
         classifier = Classifier(paths: paths, index: index, device: device, secrets: secrets)
         writer = LibraryWriter(paths: paths)
+        registry = DeviceRegistry(paths: paths, device: device)
         imagePlan = ImageRetryPlan.load(paths.local.appendingPathComponent("image-retry.json"))
     }
 
@@ -66,7 +75,9 @@ public actor Processor {
         if let leftovers = try? FileManager.default.contentsOfDirectory(at: paths.staging, includingPropertiesForKeys: nil) {
             for u in leftovers { try? FileManager.default.removeItem(at: u) }
         }
+        registry.touch()
         await index.refresh()
+        await dropSaved()
         emit(.changed)
         kick()
         await classifier.scan()
@@ -91,8 +102,8 @@ public actor Processor {
         let id = Capture.hash(t.key)
         if var old = inbox.read(id) {
             var dirty = false
-            if old.status == .failed {          // 再收藏一次失败的 = 立刻重试
-                old.status = .pending; old.nextRetryAt = nil
+            if old.status == .failed {          // 再收藏一次失败的 = 立刻重试（在这台上点的，就由这台处理）
+                old.status = .pending; old.nextRetryAt = nil; old.owner = inbox.device.id
                 dirty = true
             }
             if let hl, !(old.highlight ?? "").components(separatedBy: Self.highlightSeparator).contains(where: { Clip.normalized($0) == Clip.normalized(hl) }) {
@@ -115,7 +126,7 @@ public actor Processor {
 
     public func retry(_ id: String) {
         guard var item = inbox.read(id) else { return }
-        item.status = .pending; item.nextRetryAt = nil
+        item.status = .pending; item.nextRetryAt = nil; item.owner = inbox.device.id     // 在这台上点的重试，就由这台处理
         try? inbox.write(item)
         emit(.changed)
         kick()
@@ -135,7 +146,12 @@ public actor Processor {
     }
 
     public func queue() -> [QueueEntry] {
-        inbox.items().map { QueueEntry(item: $0, running: running.contains($0.id), claimedBy: inbox.claimedByOther($0.id)?.deviceName) }
+        let now = Date()
+        return inbox.items().map { item in
+            let due = Turn.readyAt(item, device: inbox.device, firstSeen: firstSeen[item.id] ?? now, grace: grace)
+            let waiting = item.status == .pending && !Turn.isMine(item, device: inbox.device) && (due ?? now) > now
+            return QueueEntry(item: item, running: running.contains(item.id), claimedBy: inbox.claimedByOther(item.id)?.deviceName, waiting: waiting)
+        }
     }
 
     public var isIdle: Bool { running.isEmpty && !ingesting }
@@ -153,27 +169,77 @@ public actor Processor {
 
     /// 定时器调用：同步下来的新文章、到期的重试、到期的补图
     public func tick() async {
+        registry.touch()
         if await index.refresh() { emit(.changed) }
+        await dropSaved()
         kick()
         await repairDueImages()
         await classifier.scan()
     }
 
     private func schedule() {
-        guard !paused else { return }
         let now = Date()
-        for item in inbox.items() where running.count < maxWorkers {
+        let items = inbox.items()
+        var seen: [String: Date] = [:]
+        for item in items { seen[item.id] = firstSeen[item.id] ?? now }
+        firstSeen = seen
+        guard !paused else { return }
+        var nextDue: Date?
+        for item in items where running.count < maxWorkers {
             guard !running.contains(item.id) else { continue }
-            if item.status == .failed { guard let n = item.nextRetryAt, n <= now else { continue } }
+            // 谁收藏谁处理：别的 Mac 收藏的先等一会儿，没人处理（或它失败了）才接手
+            guard let due = Turn.readyAt(item, device: inbox.device, firstSeen: seen[item.id] ?? now, grace: grace) else { continue }
+            if due > now { nextDue = min(nextDue ?? due, due); continue }
             if inbox.claimedByOther(item.id) != nil { continue }
             running.insert(item.id)
             Task { await self.process(item.id) }
         }
+        if let nextDue { wake(at: nextDue) }
+    }
+
+    /// 到点再调度一次（等别的 Mac 的那段时间里没有别的事件会触发调度）
+    private func wake(at due: Date) {
+        if let w = wakeAt, w <= due, w > Date() { return }
+        wakeAt = due
+        Task {
+            try? await Task.sleep(nanoseconds: UInt64(max(0.05, due.timeIntervalSinceNow + 0.05) * 1_000_000_000))
+            self.woke(due)
+        }
+    }
+
+    private func woke(_ due: Date) {
+        if wakeAt == due { wakeAt = nil }
+        kick()
+    }
+
+    /// 收件箱里的条目如果文章已经在库里（别的 Mac 存好了），直接清掉：
+    /// 两台同时处理时，一台存好并删了条目，另一台随后写回的「失败」记录会一直留着
+    private func dropSaved() async {
+        var dropped = false
+        for item in inbox.items() where !running.contains(item.id) {
+            guard let id = await index.lookup(key: item.key) else { continue }
+            saveHighlights(item, into: id)
+            inbox.remove(item.id)
+            dropped = true
+            emit(.merged(id: id, title: await index.title(id)))
+        }
+        if dropped { emit(.changed) }
     }
 
     private func ingestForeign() async {
         defer { ingesting = false }
-        for file in await inbox.foreignFiles() {
+        let files = await inbox.foreignFiles()
+        // 手机发来的由固定一台 Mac 先处理，别的 Mac 等一会儿、文件还在才接手
+        let primary = registry.isPrimary()
+        let now = Date()
+        var seen: [String: Date] = [:]
+        for f in files { seen[f.path] = foreignSeen[f.path] ?? now }
+        foreignSeen = seen
+        for file in files {
+            if !primary, let s = seen[file.path], now.timeIntervalSince(s) < grace {
+                wake(at: s.addingTimeInterval(grace))
+                continue
+            }
             let ext = file.pathExtension.lowercased()
             guard let data = await FileIO.read(file) else { continue }          // 还在从 iCloud 下载：下回再说
             guard let f = Inbox.parseForeign(data, ext: ext) else {
@@ -233,7 +299,15 @@ public actor Processor {
                 emit(.merged(id: existing, title: title))
             }
         } catch {
+            // 这台没抓到，但别的 Mac 可能已经存好了：那就不记失败
+            _ = await index.refresh()
+            if let existing = await index.lookup(key: item.key) {
+                inbox.remove(id)
+                emit(.merged(id: existing, title: await index.title(existing)))
+                return
+            }
             let f = Extractors.classify(error)
+            item.triedBy = Array(Set((item.triedBy ?? []) + [inbox.device.id])).sorted()
             item.status = .failed
             item.attempts += 1
             item.lastError = f.message

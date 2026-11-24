@@ -648,6 +648,7 @@ private struct QueueRow: View {
         let i = entry.item
         if entry.running { return "抓取中…" }
         if let who = entry.claimedBy { return "\(who) 正在处理" }
+        if entry.waiting { return "等收藏的那台 Mac 先处理" }
         if i.status == .pending { return "排队中" }
         if let n = i.nextRetryAt { return "\(timeString(n)) 自动重试" }
         return "需要手动重试"
